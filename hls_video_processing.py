@@ -1,3 +1,16 @@
+ # ffmpeg -re -f lavfi -i "testsrc=size=2560x1440:rate=30" \
+ #                               -c:v libx264 \
+ #                               -preset veryfast \
+ #                               -tune zerolatency \
+ #                               -b:v 18M \
+ #                               -maxrate 20M \
+ #                               -bufsize 36M \
+ #                               -pix_fmt yuv420p \
+ #                               -g 60 \
+ #                               -f flv rtmp://localhost/LiveApp/test
+
+
+
 from hls import start_hls_pipeline
 from PIL import Image
 import numpy as np

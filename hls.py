@@ -2,6 +2,8 @@ import gi
 gi.require_version("Gst", "1.0")
 from gi.repository import Gst, GLib
 import numpy as np
+import requests
+import time
 
 Gst.init(None)
 
@@ -61,11 +63,25 @@ def on_decoded_video_buffer(pad, info, streamId):
 
     return Gst.FlowReturn.OK
 
+def url_exists(url, timeout=5):
+    try:
+        response = requests.head(url, allow_redirects=True, timeout=timeout)
+        return response.status_code == 200
+    except requests.RequestException:
+        return False
+
 def start_hls_pipeline(url,on_video_frame_callback):
+    while True:
+        if url_exists(url):
+            break
+        print("waiting for hls url to be available")
+        time.sleep(3)
+
     global callback
+
     callback = on_video_frame_callback
     pipeline_str = f"""
-        souphttpsrc location="{url}" !
+        souphttpsrc   location="{url}" !
         hlsdemux !
         decodebin  ! videoconvert ! capsfilter 
         caps=video/x-raw,format=RGB  !
