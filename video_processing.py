@@ -2,10 +2,12 @@ from webrtc import WebRTCAdapter, init_gstreamer
 from gi.repository import Gst
 import numpy as np
 from PIL import Image
+import time
 
-appname = "live"
-WEBSOCKET_URL = 'wss://test.antmedia.io/' + appname + '/websocket'
-
+appname = "LiveApp"
+WEBSOCKET_URL = 'ws://127.0.0.0:5080/' + appname + '/websocket'
+last_pts = None
+pts_count = 0
 
 def on_decoded_audio_buffer(pad, info, u_data):
     gst_buffer = info.get_buffer()
@@ -51,7 +53,6 @@ def on_decoded_video_buffer(pad, info, streamId):
     gst_buffer.unmap(mapinfo)
 
     return Gst.FlowReturn.OK
-
 
 init_gstreamer()
 webrtc_adapter = WebRTCAdapter(WEBSOCKET_URL)

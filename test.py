@@ -2,10 +2,11 @@ from webrtc import WebRTCAdapter
 from webrtc import init_gstreamer
 import requests
 import time
+from gi.repository import GLib
 
-appname = "live"
-WEBSOCKET_URL = 'wss://test.antmedia.io/' + appname + '/websocket'
-prefix = "test-"
+appname = "LiveApp"
+WEBSOCKET_URL = 'ws://localhost:5080/' + appname + '/websocket'
+prefix = "myStream-"
 
 loop = None
 
@@ -16,6 +17,7 @@ def publish_test(num_streams):
         webrtc_adapter = WebRTCAdapter(WEBSOCKET_URL)
         webrtc_adapter.connect()
         webrtc_adapter.publish(prefix + str(i))
+        time.sleep(0.5) # Add a small delay
 
 
 def play_test(num_streams):
@@ -24,6 +26,7 @@ def play_test(num_streams):
     webrtc_adapter.connect()
     for i in range(num_streams):
         webrtc_adapter.play(prefix + str(i))
+        time.sleep(0.1) # Add a small delay
 
 
 def wait_for_publish(streamlist):
@@ -74,11 +77,14 @@ def get_all_active_streams(appname):
 def main():
     init_gstreamer()
 
-    nbstreams = 50
-    publish_test(nbstreams)
-
-    wait_for_publish([f"{prefix}{i}" for i in range(nbstreams)])
+    nbstreams = 100
     play_test(nbstreams)
+
+    loop = GLib.MainLoop()
+    try:
+        loop.run()
+    except KeyboardInterrupt:
+        loop.quit()
 
 
 main()

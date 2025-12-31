@@ -1,6 +1,11 @@
 # ulimit -n 65536 run this command to increase socket opening limit
-import threading
 import gi
+gi.require_version('Gst', '1.0')
+gi.require_version('GstWebRTC', '1.0')
+gi.require_version('GstSdp', '1.0')
+gi.require_version('GstVideo', '1.0')
+from gi.repository import Gst, GstSdp, GstWebRTC, GstVideo, GLib
+import threading
 import json
 import sys
 import os
@@ -8,16 +13,7 @@ import asyncio
 import ssl
 import time
 import random
-from gi.repository import GstVideo
-import json
 import websocket
-from gi.repository import GstSdp
-from gi.repository import GstWebRTC
-from gi.repository import Gst
-
-gi.require_version('Gst', '1.0')
-gi.require_version('GstWebRTC', '1.0')
-gi.require_version('GstSdp', '1.0')
 
 PIPELINE_DESC_SEND = '''
  videotestsrc ! videoconvert  ! video/x-raw,format=I420 ! x264enc  speed-preset=veryfast tune=zerolatency  ! rtph264pay !
@@ -65,7 +61,7 @@ class WebRTCAdapter:
         return self.ws_conn
 
     def socket_listner_thread(self):
-        websocket.enableTrace(True)
+        websocket.enableTrace(False)
         ws = websocket.WebSocketApp(
             self.server,
             on_message=self.on_message,
@@ -102,7 +98,7 @@ class WebRTCAdapter:
             pass
         else:
             play_client = WebRTCClient(
-                id, "play", self.ws_conn, on_video_callback, on_video_callback)
+                id, "play", self.ws_conn, on_video_callback, on_audio_callback)
             WebRTCAdapter.webrtc_clients[wrtc_client_id] = play_client
             play_client.play()
 
@@ -122,9 +118,7 @@ class WebRTCAdapter:
             publish_client.send_publish_request()
 
     def wrtc_client_exist(self, id):
-        if id in WebRTCAdapter.webrtc_clients:
-            True
-        return False
+        return id in WebRTCAdapter.webrtc_clients
 
     def get_webrtc_client(self, id):
         if id in WebRTCAdapter.webrtc_clients:
@@ -168,6 +162,8 @@ class WebRTCClient():
         self.websocket_client = ws_client
         self.on_video_callback = on_video_callback
         self.on_audio_callback = on_audio_callback
+        self.processed_pads = set()  # Track processed pads to avoid duplicates
+        self.early_candidates = []
 
     def send_publish_request(self):
         self.websocket_client.send(
@@ -238,8 +234,14 @@ class WebRTCClient():
             resample.link(sink)
 
     def handle_media_stream(self, pad, gst_pipe, convert_name, sink_name):
-        print("Trying to handle stream with {} ! {}".format(
-            convert_name, sink_name))
+        caps = pad.get_current_caps()
+        name = caps.get_structure(0).get_name()
+        print("handle_media_stream: handling caps {} with {} and {}".format(name, convert_name, sink_name))
+
+        if name.startswith("video") and convert_name != "videoconvert":
+            return
+        if name.startswith("audio") and convert_name != "audioconvert":
+            return
 
         # Create a queue and sink element
         queue = Gst.ElementFactory.make("queue", None)
@@ -250,7 +252,11 @@ class WebRTCClient():
             print("Failed to create necessary GStreamer elements.")
             return
 
-        sink.set_property("sync", False)
+        # Safely set properties if they exist
+        if sink.find_property("sync"):
+            sink.set_property("sync", False)
+        if sink.find_property("async"):
+            sink.set_property("async", False)
 
         if convert_name == "audioconvert":
             print("Audio stream detected")
@@ -317,81 +323,180 @@ class WebRTCClient():
         else:
             print("Pad successfully linked.")
 
-    def on_incoming_stream(self, webrtc, pad):
-        decode = None
-        depay = None
-        parse = None
-        jitterbuffer = None
+    def on_bus_message(self, bus, message):
+        t = message.type
+        if t == Gst.MessageType.ERROR:
+            err, debug = message.parse_error()
+            print("Error from element {}: {}".format(message.src.get_name(), err.message))
+            if debug:
+                print("Debug info: {}".format(debug))
+        elif t == Gst.MessageType.EOS:
+            print("End-of-stream")
+        elif t == Gst.MessageType.STATE_CHANGED:
+            if isinstance(message.src, Gst.Pipeline):
+                old, new, pending = message.parse_state_changed()
+                print("Pipeline {} state changed from {} to {}".format(self.id, old.value_nick, new.value_name))
+        elif t == Gst.MessageType.LATENCY:
+            self.pipe.recalculate_latency()
+        elif t == Gst.MessageType.WARNING:
+            err, debug = message.parse_warning()
+            print("Warning from element {}: {}".format(message.src.get_name(), err.message))
 
+    def on_incoming_stream(self, webrtc, pad):
+        pad_name = pad.get_name()
+        print("on_incoming_stream called for pad: {}, stream_id: {}".format(pad_name, self.id))
+        
+        # Only process source pads
+        if pad.get_direction() != Gst.PadDirection.SRC:
+            return
+        
+        # Check if pad has caps
+        if not pad.has_current_caps():
+            print("Pad {} has no caps yet, setting up caps probe".format(pad.get_name()))
+            pad.add_probe(Gst.PadProbeType.EVENT_DOWNSTREAM, self.on_pad_caps, webrtc)
+            return
+        
         caps = pad.get_current_caps()
+        if not caps:
+            return
+        
         structure = caps.get_structure(0)
         mediatype = structure.get_value("media")
+        
+        if not mediatype:
+            return
 
+        # Check if we've already processed this pad for this media type
+        if pad_name in self.processed_pads:
+            return
+        self.processed_pads.add(pad_name)
+
+        print("Processing incoming stream - media type: {}, stream_id: {}".format(mediatype, self.id))
+        
+        depay = None
         if mediatype.startswith("video"):
-            decode = Gst.ElementFactory.make("avdec_h264", None)
             depay = Gst.ElementFactory.make("rtph264depay", None)
-            parse = Gst.ElementFactory.make("h264parse", None)
             convert_name = "videoconvert"
-            sink_name = "autovideosink"
-
+            sink_name = "xvimagesink"
         elif mediatype.startswith("audio"):
-            decode = Gst.ElementFactory.make("opusdec", None)
             depay = Gst.ElementFactory.make("rtpopusdepay", None)
-            parse = Gst.ElementFactory.make("opusparse", None)
             convert_name = "audioconvert"
             sink_name = "autoaudiosink"
         else:
             print("Unknown pad {}, ignoring".format(pad.get_name()))
             return
 
-        if self.on_video_callback:
+        if self.on_video_callback and mediatype.startswith("video"):
             sink_name = "fakesink"
 
-        jitterbuffer = Gst.ElementFactory.make("rtpjitterbuffer", None)
+        # Create elements
+        queue = Gst.ElementFactory.make("queue", None)
+        # Use a larger queue for video to handle jitter better
+        if mediatype.startswith("video"):
+            queue.set_property("max-size-buffers", 200)
+            queue.set_property("max-size-time", 0)
+            queue.set_property("max-size-bytes", 0)
+        
+        decodebin = Gst.ElementFactory.make("decodebin", None)
+        decodebin.connect("pad-added", self.on_decodebin_pad_added, [convert_name, sink_name])
+        
+        if not all([queue, depay, decodebin]):
+            print("Failed to create GStreamer elements")
+            return
 
         pipeline = self.pipe
-        pipeline.add(jitterbuffer)
+        pipeline.add(queue)
         pipeline.add(depay)
-        pipeline.add(parse)
-        pipeline.add(decode)
+        pipeline.add(decodebin)
 
-        sinkpad = jitterbuffer.get_static_pad("sink")
-        if pad.link(sinkpad) != Gst.PadLinkReturn.OK:
-            print(
-                "Failed to link incoming pad to jitter buffer sink pad media type", mediatype)
+        # Link webrtcbin pad -> queue -> depay -> decodebin
+        # (webrtcbin handles jitter internally via its latency property)
+        queue_sink = queue.get_static_pad("sink")
+        ret = pad.link(queue_sink)
+        if ret != Gst.PadLinkReturn.OK:
+            print("Failed to link incoming pad {} to queue: {}".format(pad.get_name(), ret))
             return
-        else:
-            print("linked jitter buffer")
+        
+        queue.link(depay)
+        depay.link(decodebin)
 
-        jitterbuffer.link(depay)
-        depay.link(parse)
-        parse.link(decode)
-
-        for element in [depay, parse, decode, jitterbuffer]:
+        for element in [queue, depay, decodebin]:
             element.sync_state_with_parent()
 
-        decoded_pad = decode.get_static_pad("src")
-        self.handle_media_stream(
-            decoded_pad, pipeline, convert_name, sink_name)
+    def on_decodebin_pad_added(self, decodebin, pad, data):
+        convert_name, sink_name = data
+        if not pad.has_current_caps():
+            pad.add_probe(Gst.PadProbeType.EVENT_DOWNSTREAM, self.on_pad_caps_decodebin, data)
+            return
+
+        self.handle_media_stream(pad, self.pipe, convert_name, sink_name)
+
+    def on_pad_caps_decodebin(self, pad, info, user_data):
+        event = info.get_event()
+        if event and event.type == Gst.EventType.CAPS:
+            print("Caps available on decodebin pad: {}".format(pad.get_name()))
+            # Run this in the next iteration of the loop to avoid recursion issues
+            GLib.idle_add(self.handle_media_stream, pad, self.pipe, user_data[0], user_data[1])
+            return Gst.PadProbeReturn.REMOVE
+        return Gst.PadProbeReturn.OK
+
+    def on_pad_caps(self, pad, info, user_data):
+        """Callback for when caps become available on a pad"""
+        event = info.get_event()
+        if event and event.type == Gst.EventType.CAPS:
+            caps = event.get_structure()
+            if caps:
+                print("Caps now available on pad: {}, processing stream".format(pad.get_name()))
+                # Process the stream now that caps are available
+                # user_data should be the webrtc element that was passed when setting up the probe
+                webrtc = user_data if user_data else self.webrtc
+                self.on_incoming_stream(webrtc, pad)
+                return Gst.PadProbeReturn.REMOVE
+        return Gst.PadProbeReturn.OK
 
     def start_pipeline(self, mode):
         print('Creating WebRTC Pipeline', mode, self.id)
-        if (mode == "publish"):
+        if mode == "publish":
             self.pipe = Gst.parse_launch(PIPELINE_DESC_SEND)
-        elif (mode == "play"):
-            self.pipe = Gst.parse_launch(PIPELINE_DESC_RECV)
+            self.webrtc = self.pipe.get_by_name('sendrecv')
+        else:
+            # Create a pipeline and add webrtcbin to it
+            self.webrtc = Gst.ElementFactory.make("webrtcbin", "sendrecv")
+            # Set internal jitter buffer latency on webrtcbin
+            self.webrtc.set_property("latency", 500) # Back to 500ms for stability
+            self.webrtc.set_property("bundle-policy", "max-bundle")
+            self.pipe = Gst.Pipeline.new("pipeline-" + self.id)
+            self.pipe.add(self.webrtc)
 
-        self.webrtc = self.pipe.get_by_name('sendrecv')
-        if (mode == "publish"):
+        if not self.webrtc:
+            print("Failed to create or find webrtcbin element for stream {}".format(self.id))
+            return
+
+        if mode == "publish":
             self.webrtc.connect('on-negotiation-needed',
                                 self.on_negotiation_needed)
+        
         self.webrtc.connect('on-ice-candidate',
                             self.send_ice_candidate_message)
         self.webrtc.connect('pad-added', self.on_incoming_stream)
+        
+        bus = self.pipe.get_bus()
+        bus.add_signal_watch()
+        bus.connect('message', self.on_bus_message)
+        
         self.pipe.set_state(Gst.State.PLAYING)
+        
+        # Apply any candidates that arrived early
+        for cand in self.early_candidates:
+            self.webrtc.emit('add-ice-candidate', cand['label'], cand['candidate'])
+        self.early_candidates = []
 
     def take_candidate(self, data):
-        self.webrtc.emit('add-ice-candidate', data['label'], data['candidate'])
+        if self.webrtc:
+            self.webrtc.emit('add-ice-candidate', data['label'], data['candidate'])
+        else:
+            print("Queueing candidate for stream {}".format(self.id))
+            self.early_candidates.append(data)
 
     def on_offer_created(self, promise, _, __):
 
@@ -416,32 +521,54 @@ class WebRTCClient():
         promise.interrupt()
         self.send_sdp(answer.sdp, "answer")
 
+    def on_description_set(self, promise, _, __):
+        res = promise.wait()
+        if res != Gst.PromiseResult.REPLIED:
+            print("Failed to set description for stream {}".format(self.id))
+        else:
+            print("Successfully set description for stream {}".format(self.id))
+
     def take_configuration(self, data):
         if (data['type'] == 'answer'):
-            assert (self.webrtc)
+            if not self.webrtc:
+                print("Cannot set remote answer: webrtcbin not initialized for stream {}".format(self.id))
+                return
             res, sdpmsg = GstSdp.SDPMessage.new()
             GstSdp.sdp_message_parse_buffer(
                 bytes(data['sdp'].encode()), sdpmsg)
             answer = GstWebRTC.WebRTCSessionDescription.new(
                 GstWebRTC.WebRTCSDPType.ANSWER, sdpmsg)
-            promise = Gst.Promise.new()
+            promise = Gst.Promise.new_with_change_func(self.on_description_set, None, None)
             self.webrtc.emit('set-remote-description', answer, promise)
-            promise.interrupt()
 
         elif (data['type'] == 'offer'):
-            self.start_pipeline("play")
+            if self.pipe is None:
+                self.start_pipeline("play")
+            
+            if not self.webrtc:
+                print("Cannot set remote offer: webrtcbin not initialized for stream {}".format(self.id))
+                return
+
             res, sdpmsg = GstSdp.SDPMessage.new()
             GstSdp.sdp_message_parse_buffer(
                 bytes(data['sdp'].encode()), sdpmsg)
             offer = GstWebRTC.WebRTCSessionDescription.new(
                 GstWebRTC.WebRTCSDPType.OFFER, sdpmsg)
-            promise = Gst.Promise.new()
+            
+            # Chain set-remote-description and create-answer
+            promise = Gst.Promise.new_with_change_func(self.on_offer_set, self.webrtc, None)
             self.webrtc.emit('set-remote-description', offer, promise)
-            promise.interrupt()
 
-            promise = Gst.Promise.new_with_change_func(
-                self.on_answer_created, self.webrtc, None)
-            self.webrtc.emit("create-answer", None, promise)
+    def on_offer_set(self, promise, element, _):
+        reply = promise.wait()
+        if reply != Gst.PromiseResult.REPLIED:
+            print("Failed to set remote offer for stream {}".format(self.id))
+            return
+        
+        print("Remote offer set, creating answer for stream {}".format(self.id))
+        answer_promise = Gst.Promise.new_with_change_func(
+            self.on_answer_created, element, None)
+        element.emit("create-answer", None, answer_promise)
 
     def close_pipeline(self):
         print('Close Pipeline')
@@ -450,13 +577,13 @@ class WebRTCClient():
         self.webrtc = None
 
     def stop(self):
-        if WebRTCClient.ws_conn:
-            super.ws_conn.close()
-        WebRTCClient.ws_conn = None
+        if self.websocket_client:
+            self.websocket_client.close()
 
 
 def init_gstreamer():
     Gst.init(None)
+    # Gst.debug_set_default_threshold(3)
     if not check_plugins():
         sys.exit(1)
 

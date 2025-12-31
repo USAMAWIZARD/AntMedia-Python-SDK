@@ -1,5 +1,6 @@
 import argparse
 from webrtc import WebRTCAdapter, init_gstreamer
+from gi.repository import GLib
 
 parser = argparse.ArgumentParser(description="WebRTC Stream Player/Publisher")
 parser.add_argument("websocket_url", help="Full WebSocket URL (e.g., ws://ip:port/appname/websocket)")
@@ -16,3 +17,9 @@ if args.mode == "play":
     webrtc_adapter.play(args.stream_id)
 elif args.mode == "publish":
     webrtc_adapter.publish(args.stream_id)
+
+loop = GLib.MainLoop()
+try:
+    loop.run()
+except KeyboardInterrupt:
+    loop.quit()
